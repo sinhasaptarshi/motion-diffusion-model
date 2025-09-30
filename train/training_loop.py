@@ -4,7 +4,7 @@ import os
 import time
 from types import SimpleNamespace
 import numpy as np
-
+import pdb
 import re
 from os.path import join as pjoin
 from typing import Optional
@@ -101,7 +101,7 @@ class TrainLoop:
         if torch.cuda.is_available() and dist_util.dev() != 'cpu':
             self.device = torch.device(dist_util.dev())
 
-        self.schedule_sampler_type = 'uniform'
+        self.schedule_sampler_type = "loss-second-moment"
         self.schedule_sampler = create_named_schedule_sampler(self.schedule_sampler_type, diffusion)
         self.eval_wrapper, self.eval_data, self.eval_gt_data = None, None, None
         if args.dataset in ['kit', 'humanml'] and args.eval_during_training:
@@ -205,10 +205,12 @@ class TrainLoop:
                                                       self.data.dataset.t2m_dataset.opt.joints_num, self.model.all_goal_joint_names, cond['target_joint_names'], cond['is_heading']).detach()
 
     def run_loop(self):
+        # self.train_platform.wandb.watch(self.model, log='gradients', log_freq=100)
         print('train steps:', self.num_steps)
         for epoch in range(self.num_epochs):
             print(f'Starting epoch {epoch}')
             for motion, cond in tqdm(self.data):
+                # pdb.set_trace()
                 if not (not self.lr_anneal_steps or self.total_step() < self.lr_anneal_steps):
                     break
                 
@@ -226,7 +228,6 @@ class TrainLoop:
                             continue
                         else:
                             self.train_platform.report_scalar(name=k, value=v, iteration=self.total_step(), group_name='Loss')
-
                 if self.total_step() % self.save_interval == 0:
                     self.save()
                     self.model.eval()
@@ -334,7 +335,8 @@ class TrainLoop:
             else:
                 with self.ddp_model.no_sync():
                     losses = compute_losses()
-
+            # import pdb
+            # pdb.set_trace()
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
                     t, losses["loss"].detach()

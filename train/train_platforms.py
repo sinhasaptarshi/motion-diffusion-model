@@ -1,6 +1,6 @@
 import os
 import glob
-
+import pdb
 class TrainPlatform:
     def __init__(self, save_dir, *args, **kwargs):
         self.path, file = os.path.split(save_dir)
@@ -60,14 +60,16 @@ class NoPlatform(TrainPlatform):
 class WandBPlatform(TrainPlatform):
     import wandb
     def __init__(self, save_dir, config=None, *args, **kwargs):
+        # pdb.set_trace()
         super().__init__(save_dir, *args, **kwargs)
-        self.wandb.login(host=os.getenv("WANDB_BASE_URL"), key=os.getenv("WANDB_API_KEY"))
+        # self.wandb.login(host=os.getenv("WANDB_BASE_URL"), key=os.getenv("WANDB_API_KEY"))
+        # self.wandb.login(host='https://api.wandb.ai', key='d4c35e7a819e4b87f6da374f44facfdf7523ffe6')
         self.wandb.init(
+            entity="long-term-video",
             project='motion_diffusion',
-            name=self.name,
-            id=self.name,  # in order to send continued runs to the same record
-            resume='allow',  # in order to send continued runs to the same record
-            entity='tau-motion',  # will use your default entity if not set
+            name=kwargs['wandb_name'],
+            # id=self.name,  # in order to send continued runs to the same record
+            # resume='allow',  # in order to send continued runs to the same record  # will use your default entity if not set
             save_code=True,
             config=config)  # config can also be sent via report_args()
 

@@ -1,6 +1,7 @@
 import numpy as np
 import pickle
 from os.path import join as pjoin
+import pdb
 
 POS_enumerator = {
     'VERB': 0,
@@ -62,7 +63,16 @@ class WordVectorizer(object):
         return len(self.word2vec)
 
     def __getitem__(self, item):
-        word, pos = item.split('/')
+        
+        item = item.replace('//', '/')
+        if len(item.split('/')) > 2:
+            # print(item)
+            word = item.split('/')[0]
+            pos = item.split('/')[-1]
+        else:
+            word, pos = item.split('/')
+        # print(word)
+        # print(pos)
         if word in self.word2vec:
             word_vec = self.word2vec[word]
             vip_pos = None

@@ -6,14 +6,21 @@ import clip
 from model.rotation2xyz import Rotation2xyz
 from model.BERT.BERT_encoder import load_bert
 from utils.misc import WeightedSum
+import einops
+from torch import einsum
+import pdb
 
 
 class MDM(nn.Module):
     def __init__(self, modeltype, njoints, nfeats, num_actions, translation, pose_rep, glob, glob_rot,
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1,
                  ablation=None, activation="gelu", legacy=False, data_rep='rot6d', dataset='amass', clip_dim=512,
-                 arch='trans_enc', emb_trans_dec=False, clip_version=None, **kargs):
+                 arch='trans_enc', emb_trans_dec=False, clip_version=None, combine_conds='cross-attention', **kargs):
         super().__init__()
+
+        self.ignore_text = False
+        self.combine_conds = combine_conds
+        print('Combining conditions by ', self.combine_conds)
 
         self.legacy = legacy
         self.modeltype = modeltype
@@ -64,6 +71,9 @@ class MDM(nn.Module):
         self.multi_target_cond = kargs.get('multi_target_cond', False)
         self.multi_encoder_type = kargs.get('multi_encoder_type', 'multi')
         self.target_enc_layers = kargs.get('target_enc_layers', 1)
+        # self.mlp1 = nn.Linear(263, 512)
+        # self.mlp2 = nn.Linear(263, 512)
+
         if self.multi_target_cond:
             if self.multi_encoder_type == 'multi':
                 self.embed_target_cond = EmbedTargetLocMulti(self.all_goal_joint_names, self.latent_dim)
@@ -98,7 +108,12 @@ class MDM(nn.Module):
             raise ValueError('Please choose correct architecture [trans_enc, trans_dec, gru]')
 
         self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
-
+        if 'location' in self.cond_mode: 
+            self.embed_start_goal = StartPositionEmbedder(self.latent_dim, njoints*2)
+            # self.embed_start_loc = StartPositionEmbedder(self.latent_dim, njoints)
+            self.start_goal_cross_attn = CrossAttentionBlock(self.latent_dim, num_heads=8)
+            # self.embed_goal_loc = GoalPositionEmbedder(self.latent_dim, njoints)
+            # self.goal_loc_cross_attn = CrossAttentionBlock(self.latent_dim, num_heads=8)
         if self.cond_mode != 'no_cond':
             if 'text' in self.cond_mode:
                 # We support CLIP encoder and DistilBERT
@@ -116,7 +131,8 @@ class MDM(nn.Module):
                     # assert self.emb_trans_dec == False # passing just the time embed so it's fine
                     print("Loading BERT...")
                     # bert_model_path = 'model/BERT/distilbert-base-uncased'
-                    bert_model_path = 'distilbert/distilbert-base-uncased'
+                    bert_model_path = 'downloaded_models/distilbert-base-uncased'
+                    # bert_model_path = 'distilbert/distilbert-base-uncased'
                     self.clip_model = load_bert(bert_model_path)  # Sorry for that, the naming is for backward compatibility
                     self.encode_text = self.bert_encode_text
                     self.clip_dim = 768
@@ -192,13 +208,19 @@ class MDM(nn.Module):
         timesteps: [batch_size] (int)
         """
         bs, njoints, nfeats, nframes = x.shape
+
         time_emb = self.embed_timestep(timesteps)  # [1, bs, d]
 
         if 'target_cond' in y.keys():
             # NOTE: We don't use CFG for joints - but we do wat to support uncond sampling for generation and eval!
             time_emb += self.mask_cond(self.embed_target_cond(y['target_cond'], y['target_joint_names'], y['is_heading'])[None], force_mask=y.get('target_uncond', False))  # For uncond support and CFG
             # time_emb += self.embed_target_cond(y['target_cond'], y['target_joint_names'], y['is_heading'])[None]  
-
+        # ```
+        # if 'start_location' in y.keys():
+        #     ...
+        # if 'goal_location' in y.keys():
+        #     ...
+        # ```
         # Build input for prefix completion
         if self.is_prefix_comp:
             x = torch.cat([y['prefix'], x], dim=-1)
@@ -216,14 +238,49 @@ class MDM(nn.Module):
                 if text_mask.shape[0] == 1 and bs > 1:  # casting mask for the single-prompt-for-all case
                     text_mask = torch.repeat_interleave(text_mask, bs, dim=0)
             text_emb = self.embed_text(self.mask_cond(enc_text, force_mask=force_mask))  # casting mask for the single-prompt-for-all case
-            if self.emb_policy == 'add':
-                emb = text_emb + time_emb
-            else:
-                emb = torch.cat([time_emb, text_emb], dim=0)
-                text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
+
+            if 'location' not in self.cond_mode:
+                if self.emb_policy == 'add':
+                    if self.ignore_text:
+                        emb = text_emb + time_emb - text_emb
+                    else:
+                        # pdb.set_trace()
+                        emb = text_emb + time_emb
+                else:
+                    emb = torch.cat([time_emb, text_emb], dim=0)
+                    text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
         if 'action' in self.cond_mode:
             action_emb = self.embed_action(y['action'])
             emb = time_emb + self.mask_cond(action_emb, force_mask=force_mask)
+        
+        # emb = time_emb
+
+        if 'location' in self.cond_mode:
+            # pdb.set_trace()
+            emb = time_emb + text_emb
+            start_goal_emb = self.embed_start_goal(y['start_location'], y['goal_location'])
+            if self.combine_conds == 'cross-attention':
+                emb = self.start_goal_cross_attn(emb, start_goal_emb)
+            else:
+                emb = emb + start_goal_emb
+            
+            # start_loc_emb = self.embed_start_loc(y['start_location'])
+            # text_emb = self.start_loc_cross_attn(text_emb, start_loc_emb)
+            # goal_loc_emb = self.embed_goal_loc(y['goal_location'])
+            # text_emb = self.goal_loc_cross_attn(text_emb, goal_loc_emb)
+            # emb = text_emb + time_emb + start_loc_emb + goal_loc_emb
+
+            # if self.emb_policy == 'add':
+                
+            #     emb = self.mask_cond(text_emb, force_mask=force_mask) + time_emb
+            # else:
+            #     emb = torch.cat([time_emb, text_emb], dim=0)
+            #     text_mask = torch.cat([torch.zeros_like(text_mask[:, 0:1]), text_mask], dim=1)
+
+            
+            
+
+
         if self.cond_mode == 'no_cond': 
             # unconstrained
             emb = time_emb
@@ -292,9 +349,88 @@ class MDM(nn.Module):
         super().train(*args, **kwargs)
         self.rot2xyz.smpl_model.train(*args, **kwargs)
 
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+
+class CrossAttentionB(nn.Module):
+    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, context = None, kv_include_self = False):
+        b, n, _, h = *x.shape, self.heads
+        x = self.norm(x)
+        context = default(context, x)
+
+        if kv_include_self:
+            context = torch.cat((x, context), dim = 1) # cross attention requires CLS token includes itself as key / value
+
+        qkv = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
+        q, k, v = map(lambda t: einops.rearrange(t, 'b n (h d) -> b h n d', h = h), qkv)
+
+        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = einops.rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+
+class CrossAttentionBlock(nn.Module):
+
+    def __init__(
+            self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+            drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, iterative_shots=False, no_exemplars=False):
+        super().__init__()
+        
+        # self.norm1 = norm_layer(dim)
+        self.attn = CrossAttentionB(dim, heads=num_heads)
+
+        
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        # self.norm2 = norm_layer(dim)
+        # self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout=0.0)
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        # self.iterative_shots = iterative_shots
+
+
+    def forward(self, x, y):
+
+        x = x.permute(1, 0, 2)
+        y = y.permute(1, 0, 2)
+       
+        x = x + self.drop_path1(self.attn(x, y))
+        # x = x + self.drop_path2(self.mlp(x))
+        x = x.permute(1, 0, 2)
+        return x
+
+
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
+    def __init__(self, d_model, dropout=0.1, max_len=10000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -328,6 +464,38 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, timesteps):
         return self.time_embed(self.sequence_pos_encoder.pe[timesteps]).permute(1, 0, 2)
+
+
+class StartPositionEmbedder(nn.Module):
+    def __init__(self, latent_dim, pose_dim):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.pose_dim = pose_dim
+
+        self.embed = nn.Sequential(
+            nn.Linear(self.pose_dim, self.latent_dim),
+            # nn.SiLU(),
+            # nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+    def forward(self, start_pose, goal_pose):
+        poses = torch.cat([start_pose, goal_pose], -1)
+        return self.embed(poses).permute(1,0,2)
+
+class GoalPositionEmbedder(nn.Module):
+    def __init__(self, latent_dim, pose_dim):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.pose_dim = pose_dim
+
+        self.embed = nn.Sequential(
+            nn.Linear(self.pose_dim, self.latent_dim),
+            # nn.SiLU(),
+            # nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+    def forward(self, goal_pose):
+        return self.embed(goal_pose).permute(1,0,2)
 
 
 class InputProcess(nn.Module):
@@ -417,6 +585,7 @@ class EmbedTargetLocSingle(nn.Module):
 
         mlp_input = torch.cat([input, validity], dim=-1).view(input.shape[0], -1)
         return self.mlp(mlp_input)
+
 
 
 class EmbedTargetLocSplit(nn.Module):

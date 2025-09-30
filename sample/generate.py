@@ -5,6 +5,8 @@ numpy array. This can be used to produce samples for FID evaluation.
 """
 from utils.fixseed import fixseed
 import os
+from tqdm import tqdm
+import pdb
 import numpy as np
 import torch
 from utils.parser_util import generate_args
@@ -12,12 +14,120 @@ from utils.model_util import create_model_and_diffusion, load_saved_model
 from utils import dist_util
 from utils.sampler_util import ClassifierFreeSampleModel, AutoRegressiveSampler
 from data_loaders.get_data import get_dataset_loader
-from data_loaders.humanml.scripts.motion_process import recover_from_ric, get_target_location, sample_goal
+from data_loaders.humanml.scripts.motion_process import get_target_location, sample_goal #recover_from_ric,
 import data_loaders.humanml.utils.paramUtil as paramUtil
 from data_loaders.humanml.utils.plot_script import plot_3d_motion
 import shutil
 from data_loaders.tensors import collate
 from moviepy.editor import clips_array
+
+def qinv(q):
+    assert q.shape[-1] == 4, 'q must be a tensor of shape (*, 4)'
+    mask = torch.ones_like(q)
+    mask[..., 1:] = -mask[..., 1:]
+    return q * mask
+def qrot(q, v):
+    """
+    Rotate vector(s) v about the rotation described by quaternion(s) q.
+    Expects a tensor of shape (*, 4) for q and a tensor of shape (*, 3) for v,
+    where * denotes any number of dimensions.
+    Returns a tensor of shape (*, 3).
+    """
+    assert q.shape[-1] == 4
+    assert v.shape[-1] == 3
+    assert q.shape[:-1] == v.shape[:-1]
+
+    original_shape = list(v.shape)
+    # print(q.shape)
+    q = q.contiguous().view(-1, 4)
+    v = v.contiguous().view(-1, 3)
+
+    qvec = q[:, 1:]
+    uv = torch.cross(qvec, v, dim=1)
+    uuv = torch.cross(qvec, uv, dim=1)
+    return (v + 2 * (q[:, :1] * uv + uuv)).view(original_shape)
+
+
+def recover_root_rot_pos(data, downsample_factor=12):
+    """
+    Recovers root rotation quaternion and root position from RIC data,
+    adapted for downsampled input.
+
+    Args:
+        data (torch.Tensor): The input RIC data with shape (..., T, C).
+                             C=263, where C[0] is root_rot_vel_y,
+                             C[1:3] are root_local_pos_xz, C[3] is root_local_pos_y.
+        downsample_factor (int): The factor by which the original data was downsampled.
+                                 e.g., if downsampled to every 12 frames, this is 12.
+
+    Returns:
+        tuple: (r_rot_quat, r_pos)
+               r_rot_quat (torch.Tensor): Root rotation quaternions.
+               r_pos (torch.Tensor): Root positions.
+    """
+    rot_vel = data[..., 0]
+    r_rot_ang = torch.zeros_like(rot_vel).to(data.device)
+
+    # Get Y-axis rotation from rotation velocity
+    # If data is downsampled, rot_vel[..., :-1] represents the velocity at the previous
+    # downsampled frame. To get the total angle change over the skipped frames,
+    # we multiply by the downsample_factor.
+    r_rot_ang[..., 1:] = rot_vel[..., :-1] * downsample_factor
+    r_rot_ang = torch.cumsum(r_rot_ang, dim=-1)
+
+    r_rot_quat = torch.zeros(data.shape[:-1] + (4,)).to(data.device)
+    # Convert Y-axis rotation angle to quaternion (around Y-axis)
+    r_rot_quat[..., 0] = torch.cos(r_rot_ang)
+    r_rot_quat[..., 2] = torch.sin(r_rot_ang)
+
+    r_pos = torch.zeros(data.shape[:-1] + (3,)).to(data.device)
+    # Relative root position in XZ plane
+    # Similar to rot_vel, if downsampled, data[..., :-1, 1:3] represents the displacement
+    # at the previous downsampled frame. Multiply by downsample_factor for total displacement.
+    r_pos[..., 1:, [0, 2]] = data[..., :-1, 1:3] * downsample_factor
+
+    # Add Y-axis rotation to root position (this rotates the relative XZ displacement)
+    r_pos = qrot(qinv(r_rot_quat), r_pos)
+
+    # Accumulate the root positions over time
+    r_pos = torch.cumsum(r_pos, dim=-2) # Assuming -2 is the time dimension
+
+    # Set the Y-component of the root position (this is likely an absolute Y-position)
+    r_pos[..., 1] = data[..., 3]
+    return r_rot_quat, r_pos
+
+def recover_from_ric(data, joints_num=22, downsample_factor=12):
+    """
+    Recovers full joint positions from RIC data, adapted for downsampled input.
+
+    Args:
+        data (torch.Tensor): The input RIC data with shape (..., T, C).
+                             C=263, containing root motion and relative joint positions.
+        joints_num (int): The total number of joints (including root).
+        downsample_factor (int): The factor by which the original data was downsampled.
+
+    Returns:
+        torch.Tensor: The recovered absolute joint positions.
+    """
+    # Call the modified recover_root_rot_pos with the downsample_factor
+    r_rot_quat, r_pos = recover_root_rot_pos(data, downsample_factor)
+
+    # Extract local joint positions (excluding root)
+    positions = data[..., 4:(joints_num - 1) * 3 + 4]
+    positions = positions.view(positions.shape[:-1] + (-1, 3))
+
+    # Add Y-axis rotation to local joints
+    # Expand r_rot_quat to match the shape of positions for batch quaternion multiplication
+    positions = qrot(qinv(r_rot_quat[..., None, :]).expand(positions.shape[:-1] + (4,)), positions)
+
+    # Add root XZ translation to joints
+    positions[..., 0] += r_pos[..., 0:1]
+    positions[..., 2] += r_pos[..., 2:3]
+
+    # Concatenate root position with local joint positions
+    positions = torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
+
+    return positions
 
 
 def main(args=None):
@@ -26,12 +136,19 @@ def main(args=None):
         args = generate_args()
     fixseed(args.seed)
     out_path = args.output_dir
-    n_joints = 22 if args.dataset == 'humanml' else 21
+    args.dataset = 'HDEPIC'
+    n_joints = 22 if args.dataset in ['humanml', 'HDEPIC'] else 21
     name = os.path.basename(os.path.dirname(args.model_path))
     niter = os.path.basename(args.model_path).replace('model', '').replace('.pt', '')
-    max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
+    
+    max_frames = 196 if args.dataset in ['kit', 'humanml'] else 400
+    if args.dataset == 'HDEPIC':
+        max_frames = 400
+    else:
+        max_frames = 250
     fps = 12.5 if args.dataset == 'kit' else 20
     n_frames = min(max_frames, int(args.motion_length*fps))
+    n_frames = max_frames
     is_using_data = not any([args.input_text, args.text_prompt, args.action_file, args.action_name])
     if args.context_len > 0:
         is_using_data = True  # For prefix completion, we need to sample a prefix
@@ -77,7 +194,10 @@ def main(args=None):
 
     print('Loading dataset...')
     data = load_dataset(args, max_frames, n_frames)
+    
     total_num_samples = args.num_samples * args.num_repetitions
+
+    args.combine_conds = 'cross-attention'
 
     print("Creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(args, data)
@@ -101,6 +221,7 @@ def main(args=None):
         iterator = iter(data)
         input_motion, model_kwargs = next(iterator)
         input_motion = input_motion.to(dist_util.dev())
+        # pdb.set_trace()
         if texts is not None:
             model_kwargs['y']['text'] = texts
     else:
@@ -122,73 +243,87 @@ def main(args=None):
     all_motions = []
     all_lengths = []
     all_text = []
-
+    all_names = []
+    for input_motion, model_kwargs in tqdm(data):
+        # pdb.set_trace()
     # add CFG scale to batch
-    if args.guidance_param != 1:
-        model_kwargs['y']['scale'] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
-    
-    if 'text' in model_kwargs['y'].keys():
-        # encoding once instead of each iteration saves lots of time
-        model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
-    
-    if args.dynamic_text_path != '':
-        # Rearange the text to match the autoregressive sampling - each prompt fits to a single prediction
-        # Which is 2 seconds of motion by default
-        model_kwargs['y']['text'] = [model_kwargs['y']['text']] * args.num_samples
-        if args.text_encoder_type == 'bert':
-            model_kwargs['y']['text_embed'] = (model_kwargs['y']['text_embed'][0].unsqueeze(0).repeat(args.num_samples, 1, 1, 1), 
-                                               model_kwargs['y']['text_embed'][1].unsqueeze(0).repeat(args.num_samples, 1, 1))
-        else:
-            raise NotImplementedError('DiP model only supports BERT text encoder at the moment. If you implement this, please send a PR!')
-    
-    for rep_i in range(args.num_repetitions):
-        print(f'### Sampling [repetitions #{rep_i}]')
+        if args.guidance_param != 1:
+            model_kwargs['y']['scale'] = torch.ones(args.batch_size, device=dist_util.dev()) * args.guidance_param
+        
+        if 'start_location' in model_kwargs['y']:
+            model_kwargs['y']['start_location'] = model_kwargs['y']['start_location'].cuda()
 
-        sample = sample_fn(
-            model,
-            motion_shape,
-            clip_denoised=False,
-            model_kwargs=model_kwargs,
-            skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
-            init_image=init_image,
-            progress=True,
-            dump_steps=None,
-            noise=None,
-            const_noise=False,
-        )
+        if 'goal_location' in model_kwargs['y']:
+            model_kwargs['y']['goal_location'] = model_kwargs['y']['goal_location'].cuda()
 
-        # Recover XYZ *positions* from HumanML3D vector representation
-        if model.data_rep == 'hml_vec':
-            n_joints = 22 if sample.shape[1] == 263 else 21
-            sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
-            sample = recover_from_ric(sample, n_joints)
-            sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
+        
+        if 'text' in model_kwargs['y'].keys():
+            # encoding once instead of each iteration saves lots of time
+            model_kwargs['y']['text_embed'] = model.encode_text(model_kwargs['y']['text'])
+        
+        if args.dynamic_text_path != '':
+            # Rearange the text to match the autoregressive sampling - each prompt fits to a single prediction
+            # Which is 2 seconds of motion by default
+            args.num_samples = len(input_motion)
+            model_kwargs['y']['text'] = [model_kwargs['y']['text']] * args.num_samples
+            if args.text_encoder_type == 'bert':
+                model_kwargs['y']['text_embed'] = (model_kwargs['y']['text_embed'][0].unsqueeze(0).repeat(args.num_samples, 1, 1, 1), 
+                                                model_kwargs['y']['text_embed'][1].unsqueeze(0).repeat(args.num_samples, 1, 1))
+            else:
+                raise NotImplementedError('DiP model only supports BERT text encoder at the moment. If you implement this, please send a PR!')
+        
+        for rep_i in range(args.num_repetitions):
+            print(f'### Sampling [repetitions #{rep_i}]')
+            with torch.no_grad():
+                sample = sample_fn(
+                    model,
+                    motion_shape,
+                    clip_denoised=False,
+                    model_kwargs=model_kwargs,
+                    skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
+                    init_image=init_image,
+                    progress=True,
+                    dump_steps=None,
+                    noise=None,
+                    const_noise=False,
+                )
+            # pdb.set_trace()
+            # Recover XYZ *positions* from HumanML3D vector representation
+            if model.data_rep == 'hml_vec':
+                n_joints = 22 if sample.shape[1] == 263 else 21
+                # pdb.set_trace()
+                sample = data.dataset.t2m_dataset.inv_transform(sample.cpu().permute(0, 2, 3, 1)).float()
+                # import pdb
+                # pdb.set_trace()
+                sample = recover_from_ric(sample, n_joints, downsample_factor=12)
+                sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
 
-        rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
-        rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, n_frames).bool()
-        sample = model.rot2xyz(x=sample, mask=rot2xyz_mask, pose_rep=rot2xyz_pose_rep, glob=True, translation=True,
-                               jointstype='smpl', vertstrans=True, betas=None, beta=0, glob_rot=None,
-                               get_rotations_back=False)
+            rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
+            rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, n_frames).bool()
+            sample = model.rot2xyz(x=sample, mask=rot2xyz_mask, pose_rep=rot2xyz_pose_rep, glob=True, translation=True,
+                                jointstype='smpl', vertstrans=True, betas=None, beta=0, glob_rot=None,
+                                get_rotations_back=False)
 
-        if args.unconstrained:
-            all_text += ['unconstrained'] * args.num_samples
-        else:
-            text_key = 'text' if 'text' in model_kwargs['y'] else 'action_text'
-            all_text += model_kwargs['y'][text_key]
+            if args.unconstrained:
+                all_text += ['unconstrained'] * args.num_samples
+            else:
+                text_key = 'text' if 'text' in model_kwargs['y'] else 'action_text'
+                all_text += model_kwargs['y'][text_key]
+            all_names += model_kwargs['y']['db_key']
+            all_motions.append(sample.cpu().numpy())
+            _len = model_kwargs['y']['lengths'].cpu().numpy()
+            if 'prefix' in model_kwargs['y'].keys():
+                _len[:] = sample.shape[-1]
+            all_lengths.append(_len)
 
-        all_motions.append(sample.cpu().numpy())
-        _len = model_kwargs['y']['lengths'].cpu().numpy()
-        if 'prefix' in model_kwargs['y'].keys():
-            _len[:] = sample.shape[-1]
-        all_lengths.append(_len)
-
-        print(f"created {len(all_motions) * args.batch_size} samples")
+            print(f"created {len(all_motions) * args.batch_size} samples")
 
 
     all_motions = np.concatenate(all_motions, axis=0)
-    all_motions = all_motions[:total_num_samples]  # [bs, njoints, 6, seqlen]
-    all_text = all_text[:total_num_samples]
-    all_lengths = np.concatenate(all_lengths, axis=0)[:total_num_samples]
+    # all_motions = all_motions[:total_num_samples]  # [bs, njoints, 6, seqlen]
+    # all_text = all_text[:total_num_samples]
+    all_lengths = np.concatenate(all_lengths, axis=0)
+    # all_lengths = np.concatenate(all_lengths, axis=0)[:total_num_samples]
 
     if os.path.exists(out_path):
         shutil.rmtree(out_path)
@@ -198,7 +333,7 @@ def main(args=None):
     print(f"saving results file to [{npy_path}]")
     np.save(npy_path,
             {'motion': all_motions, 'text': all_text, 'lengths': all_lengths,
-             'num_samples': args.num_samples, 'num_repetitions': args.num_repetitions})
+             'num_samples': args.num_samples, 'num_repetitions': args.num_repetitions, 'names': all_names})
     if args.dynamic_text_path != '':
         text_file_content = '\n'.join(['#'.join(s) for s in all_text])
     else:
@@ -301,10 +436,14 @@ def construct_template_variables(unconstrained):
 
 
 def load_dataset(args, max_frames, n_frames):
+    # import pdb
+    # pdb.set_trace()
     data = get_dataset_loader(name=args.dataset,
-                              batch_size=args.batch_size,
+                              batch_size=args.num_samples,
+                              shuffle=False,
                               num_frames=max_frames,
                               split='test',
+                            #   hml_mode='eval',
                               hml_mode='train' if args.pred_len > 0 else 'text_only',  # We need to sample a prefix from the dataset
                               fixed_len=args.pred_len + args.context_len, pred_len=args.pred_len, device=dist_util.dev())
     data.fixed_length = n_frames

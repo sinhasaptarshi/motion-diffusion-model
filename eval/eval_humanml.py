@@ -10,6 +10,7 @@ from data_loaders.humanml.utils.utils import *
 from utils.model_util import create_model_and_diffusion, load_saved_model
 
 from diffusion import logger
+import pdb
 from utils import dist_util
 from data_loaders.get_data import get_dataset_loader
 from utils.sampler_util import ClassifierFreeSampleModel
@@ -21,6 +22,7 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
     match_score_dict = OrderedDict({})
     R_precision_dict = OrderedDict({})
     activation_dict = OrderedDict({})
+    # pdb.set_trace()
     print('========== Evaluating Matching Score ==========')
     for motion_loader_name, motion_loader in motion_loaders.items():
         all_motion_embeddings = []
@@ -31,7 +33,10 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
         # print(motion_loader_name)
         with torch.no_grad():
             for idx, batch in enumerate(motion_loader):
-                word_embeddings, pos_one_hots, _, sent_lens, motions, m_lens, _ = batch
+                if len(batch) > 7:
+                    word_embeddings, pos_one_hots, _, sent_lens, motions, m_lens,_,_, _ = batch
+                else:
+                    word_embeddings, pos_one_hots, _, sent_lens, motions, m_lens, _ = batch
                 text_embeddings, motion_embeddings = eval_wrapper.get_co_embeddings(
                     word_embs=word_embeddings,
                     pos_ohot=pos_one_hots,
@@ -76,7 +81,10 @@ def evaluate_fid(eval_wrapper, groundtruth_loader, activation_dict, file):
     print('========== Evaluating FID ==========')
     with torch.no_grad():
         for idx, batch in enumerate(groundtruth_loader):
-            _, _, _, sent_lens, motions, m_lens, _ = batch
+            _, _, _, sent_lens, motions, m_lens, _, _, _ = batch
+            # if min(m_lens) <= 0:
+            #     import pdb
+            #     pdb.set_trace()
             motion_embeddings = eval_wrapper.get_motion_embeddings(
                 motions=motions,
                 m_lens=m_lens
@@ -144,6 +152,7 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
                                    'FID': OrderedDict({}),
                                    'Diversity': OrderedDict({}),
                                    'MultiModality': OrderedDict({})})
+        # pdb.set_trace()
         for replication in range(replication_times):
             motion_loaders = {}
             mm_motion_loaders = {}
@@ -255,7 +264,7 @@ if __name__ == '__main__':
     print(f'Will save to log file [{log_file}]')
 
     eval_platform_type = eval(args.train_platform_type)
-    eval_platform = eval_platform_type(save_dir, name=log_name)
+    eval_platform = eval_platform_type(save_dir, name=log_name, wandb_name=args.wandb_name)
     eval_platform.report_args(args, name='Args')
 
     print(f'Eval mode [{args.eval_mode}]')
@@ -292,6 +301,7 @@ if __name__ == '__main__':
 
     logger.log("creating data loader...")
     split = 'test'
+    # split = 'train'
     gt_loader = get_dataset_loader(name=args.dataset, batch_size=args.batch_size, num_frames=None, split=split, hml_mode='gt')
     # gen_loader = get_dataset_loader(name=args.dataset, batch_size=args.batch_size, num_frames=None, split=split, hml_mode='eval')
     # added new features + support for prefix completion:

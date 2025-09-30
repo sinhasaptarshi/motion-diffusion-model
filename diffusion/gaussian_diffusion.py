@@ -18,6 +18,7 @@ from diffusion.losses import normal_kl, discretized_gaussian_log_likelihood
 from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
+from data_loaders.humanml.scripts.motion_process import recover_from_ric, get_target_location, sample_goal
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -132,7 +133,7 @@ class GaussianDiffusion:
         lambda_pose=1.,
         lambda_orient=1.,
         lambda_loc=1.,
-        data_rep='rot6d',
+        data_rep='xyz',
         lambda_root_vel=0.,
         lambda_vel_rcxyz=0.,
         lambda_fc=0.,
@@ -1243,7 +1244,11 @@ class GaussianDiffusion:
                                              # jointstype='vertices',  # 3.4 iter/sec # USED ALSO IN MotionCLIP
                                              jointstype='smpl',  # 3.4 iter/sec
                                              vertstrans=False)
-
+        # get_xyz = lambda sample: enc.rot2xyz(sample, mask=None, pose_rep=enc.pose_rep, translation=enc.translation,
+        #                                      glob=enc.glob,
+        #                                      # jointstype='vertices',  # 3.4 iter/sec # USED ALSO IN MotionCLIP
+        #                                      jointstype='vertices',  # 3.4 iter/sec
+        #                                      vertstrans=False)
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
@@ -1296,41 +1301,80 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape  # [bs, njoints, nfeats, nframes]
-
-            terms["rot_mse"] = self.masked_l2(target, model_output, mask) # mean_flat(rot_mse)
+            # import pdb
+            # pdb.set_trace()
+            terms["rot_mse"] = self.masked_l2(target, model_output, mask, dataset=dataset) # mean_flat(rot_mse)
 
             target_xyz, model_output_xyz = None, None
 
             if self.lambda_rcxyz > 0.:
-                target_xyz = get_xyz(target)  # [bs, nvertices(vertices)/njoints(smpl), 3, nframes]
-                model_output_xyz = get_xyz(model_output)  # [bs, nvertices, 3, nframes]
-                terms["rcxyz_mse"] = self.masked_l2(target_xyz, model_output_xyz, mask)  # mean_flat((target_xyz - model_output_xyz) ** 2)
-
+                if self.data_rep == 'rot6d':
+                    target_xyz = get_xyz(target)  # [bs, nvertices(vertices)/njoints(smpl), 3, nframes]
+                    model_output_xyz = get_xyz(model_output)  # [bs, nvertices, 3, nframes]
+                    terms["rcxyz_mse"] = self.masked_l2(target_xyz, model_output_xyz, mask)  # mean_flat((target_xyz - model_output_xyz) ** 2)
+                else:
+                    target_xyz = recover_from_ric(target.permute(0, 2, 3, 1), 22).squeeze(1).permute(0,2,3,1)
+                    model_output_xyz = recover_from_ric(model_output.permute(0, 2, 3, 1), 22).squeeze(1).permute(0,2,3,1)
+                    terms["rcxyz_mse"] = self.masked_l2(target_xyz, model_output_xyz, mask)  # mean_flat((target_xyz - model_output_xyz) ** 2)
             if self.lambda_vel_rcxyz > 0.:
-                if self.data_rep == 'rot6d' and dataset.dataname in ['humanact12', 'uestc']:
-                    target_xyz = get_xyz(target) if target_xyz is None else target_xyz
-                    model_output_xyz = get_xyz(model_output) if model_output_xyz is None else model_output_xyz
-                    target_xyz_vel = (target_xyz[:, :, :, 1:] - target_xyz[:, :, :, :-1])
-                    model_output_xyz_vel = (model_output_xyz[:, :, :, 1:] - model_output_xyz[:, :, :, :-1])
-                    terms["vel_xyz_mse"] = self.masked_l2(target_xyz_vel, model_output_xyz_vel, mask[:, :, :, 1:])
+                import pdb
+                pdb.set_trace()
+                if dataset.dataname in ['humanact12', 'uestc', 'humanml', 't2m']:
+                    if self.data_rep == 'rot6d':
+                        target_xyz = get_xyz(target) if target_xyz is None else target_xyz
+                        model_output_xyz = get_xyz(model_output) if model_output_xyz is None else model_output_xyz
+                        target_xyz_vel = (target_xyz[:, :, :, 1:] - target_xyz[:, :, :, :-1])
+                        model_output_xyz_vel = (model_output_xyz[:, :, :, 1:] - model_output_xyz[:, :, :, :-1])
+                        terms["vel_xyz_mse"] = self.masked_l2(target_xyz_vel, model_output_xyz_vel, mask[:, :, :, 1:])
+                    else:
+                        target_xyz = recover_from_ric(target.permute(0, 2, 3, 1), 22).squeeze(1).permute(0,2,3,1)
+                        model_output_xyz = recover_from_ric(model_output.permute(0, 2, 3, 1), 22).squeeze(1).permute(0,2,3,1)
+                        target_xyz_vel = (target_xyz[:, :, :, 1:] - target_xyz[:, :, :, :-1])
+                        model_output_xyz_vel = (model_output_xyz[:, :, :, 1:] - model_output_xyz[:, :, :, :-1])
+                        terms["vel_xyz_mse"] = self.masked_l2(target_xyz_vel, model_output_xyz_vel, mask[:, :, :, 1:])
+
 
             if self.lambda_fc > 0.:
+                # import pdb
+                # pdb.set_trace()
                 torch.autograd.set_detect_anomaly(True)
-                if self.data_rep == 'rot6d' and dataset.dataname in ['humanact12', 'uestc']:
-                    target_xyz = get_xyz(target) if target_xyz is None else target_xyz
-                    model_output_xyz = get_xyz(model_output) if model_output_xyz is None else model_output_xyz
-                    # 'L_Ankle',  # 7, 'R_Ankle',  # 8 , 'L_Foot',  # 10, 'R_Foot',  # 11
-                    l_ankle_idx, r_ankle_idx, l_foot_idx, r_foot_idx = 7, 8, 10, 11
-                    relevant_joints = [l_ankle_idx, l_foot_idx, r_ankle_idx, r_foot_idx]
-                    gt_joint_xyz = target_xyz[:, relevant_joints, :, :]  # [BatchSize, 4, 3, Frames]
-                    gt_joint_vel = torch.linalg.norm(gt_joint_xyz[:, :, :, 1:] - gt_joint_xyz[:, :, :, :-1], axis=2)  # [BatchSize, 4, Frames]
-                    fc_mask = torch.unsqueeze((gt_joint_vel <= 0.01), dim=2).repeat(1, 1, 3, 1)
-                    pred_joint_xyz = model_output_xyz[:, relevant_joints, :, :]  # [BatchSize, 4, 3, Frames]
-                    pred_vel = pred_joint_xyz[:, :, :, 1:] - pred_joint_xyz[:, :, :, :-1]
-                    pred_vel[~fc_mask] = 0
-                    terms["fc"] = self.masked_l2(pred_vel,
-                                                 torch.zeros(pred_vel.shape, device=pred_vel.device),
-                                                 mask[:, :, :, 1:])
+                # if self.data_rep == 'rot6d' and dataset.dataname in ['humanact12', 'uestc', 'humanml']:
+                if dataset.dataname in ['humanact12', 'uestc', 'humanml','t2m']:
+
+                    if self.data_rep == 'rot6d':
+                        target_xyz = get_xyz(target) if target_xyz is None else target_xyz
+                        model_output_xyz = get_xyz(model_output) if model_output_xyz is None else model_output_xyz
+                        # 'L_Ankle',  # 7, 'R_Ankle',  # 8 , 'L_Foot',  # 10, 'R_Foot',  # 11
+                        l_ankle_idx, r_ankle_idx, l_foot_idx, r_foot_idx = 7, 8, 10, 11
+                        relevant_joints = [l_ankle_idx, l_foot_idx, r_ankle_idx, r_foot_idx]
+                        gt_joint_xyz = target_xyz[:, relevant_joints, :, :]  # [BatchSize, 4, 3, Frames]
+                        gt_joint_vel = torch.linalg.norm(gt_joint_xyz[:, :, :, 1:] - gt_joint_xyz[:, :, :, :-1], axis=2)  # [BatchSize, 4, Frames]
+                        fc_mask = torch.unsqueeze((gt_joint_vel <= 0.01), dim=2).repeat(1, 1, 3, 1)
+                        pred_joint_xyz = model_output_xyz[:, relevant_joints, :, :]  # [BatchSize, 4, 3, Frames]
+                        pred_vel = pred_joint_xyz[:, :, :, 1:] - pred_joint_xyz[:, :, :, :-1]
+                        pred_vel[~fc_mask] = 0
+                        terms["fc"] = self.masked_l2(pred_vel,
+                                                    torch.zeros(pred_vel.shape, device=pred_vel.device),
+                                                    mask[:, :, :, 1:])
+                    else:
+                        # import pdb
+                        # pdb.set_trace()
+                        target_xyz = recover_from_ric(target.permute(0, 2, 3, 1), 22).squeeze(1).permute(0,2,3,1)
+                        model_output_xyz = recover_from_ric(model_output.permute(0, 2, 3, 1), 22).squeeze(1).permute(0,2,3,1)
+                        l_ankle_idx, r_ankle_idx, l_foot_idx, r_foot_idx = 7, 8, 10, 11
+                        relevant_joints = [l_ankle_idx, l_foot_idx, r_ankle_idx, r_foot_idx]
+                        gt_joint_xyz = target_xyz[:, relevant_joints, :, :]  # [BatchSize, 4, 3, Frames]
+                        gt_joint_vel = torch.linalg.norm(gt_joint_xyz[:, :, :, 1:] - gt_joint_xyz[:, :, :, :-1], axis=2)  # [BatchSize, 4, Frames]
+                        fc_mask = torch.unsqueeze((gt_joint_vel <= 0.01), dim=2).repeat(1, 1, 3, 1)
+                        pred_joint_xyz = model_output_xyz[:, relevant_joints, :, :]  # [BatchSize, 4, 3, Frames]
+                        pred_vel = pred_joint_xyz[:, :, :, 1:] - pred_joint_xyz[:, :, :, :-1]
+                        pred_vel[~fc_mask] = 0
+                        import pdb
+                        pdb.set_trace()
+                        terms["fc"] = self.masked_l2(pred_vel,
+                                                    torch.zeros(pred_vel.shape, device=pred_vel.device),
+                                                    mask[:, :, :, 1:])
+            
             if self.lambda_vel > 0.:
                 target_vel = (target[..., 1:] - target[..., :-1])
                 model_output_vel = (model_output[..., 1:] - model_output[..., :-1])

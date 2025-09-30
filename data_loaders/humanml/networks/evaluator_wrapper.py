@@ -15,8 +15,11 @@ def build_models(opt):
                                       output_size=opt.dim_coemb_hidden,
                                       device=opt.device)
 
-    checkpoint = torch.load(pjoin(opt.checkpoints_dir, opt.dataset_name, 'text_mot_match', 'model', 'finest.tar'),
+    checkpoint = torch.load(pjoin(opt.checkpoints_dir, opt.dataset_name, 'text_mot_match', 'model_latest', 'finest_orig.tar'),
                             map_location=opt.device)
+
+    # checkpoint = torch.load('/home/s5a/ve22636.s5a/motion-diffusion-model/old_model/t2m/text_mot_match/model/finest.tar', map_location=opt.device)
+    
     movement_enc.load_state_dict(checkpoint['movement_encoder'])
     text_enc.load_state_dict(checkpoint['text_encoder'])
     motion_enc.load_state_dict(checkpoint['motion_encoder'])
@@ -109,8 +112,10 @@ def build_evaluators(opt):
     if opt['dataset_name'] == 'humanml':
         ckpt_dir = 't2m'
 
-    checkpoint = torch.load(pjoin(opt['checkpoints_dir'], ckpt_dir, 'text_mot_match', 'model', 'finest.tar'),
+    checkpoint = torch.load(pjoin(opt['checkpoints_dir'], ckpt_dir, 'text_mot_match', 'model_latest', 'finest_orig.tar'),
                             map_location=opt['device'])
+
+    # checkpoint = torch.load('/home/s5a/ve22636.s5a/motion-diffusion-model/old_model/t2m/text_mot_match/model/finest.tar', map_location=opt['device'])
     movement_enc.load_state_dict(checkpoint['movement_encoder'])
     text_enc.load_state_dict(checkpoint['text_encoder'])
     motion_enc.load_state_dict(checkpoint['motion_encoder'])
@@ -134,7 +139,7 @@ class EvaluatorMDMWrapper(object):
             'dim_pose': 263 if dataset_name == 'humanml' else 251,
             'dim_movement_enc_hidden': 512,
             'dim_movement_latent': 512,
-            'checkpoints_dir': '.',
+            'checkpoints_dir': '../text-to-motion/checkpoints/',
             'unit_length': 4,
         }
 

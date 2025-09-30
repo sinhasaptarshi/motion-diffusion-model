@@ -47,6 +47,15 @@ def collate(batch):
         actionbatch = [b['action'] for b in notnone_batches]
         cond['y'].update({'action': torch.as_tensor(actionbatch).unsqueeze(1)})
 
+    if 'start_location'in notnone_batches[0] and notnone_batches[0]['start_location'] is not None:
+        start_locations = [b['start_location'] for b in notnone_batches]
+        # print(torch.Tensor(start_locations))
+        cond['y'].update({'start_location': torch.Tensor(start_locations).unsqueeze(1)})
+
+    if 'goal_location'in notnone_batches[0] and notnone_batches[0]['goal_location'] is not None:
+        goal_locations = [b['goal_location'] for b in notnone_batches]
+        cond['y'].update({'goal_location': torch.Tensor(goal_locations).unsqueeze(1)})
+
     # collate action textual names
     if 'action_text' in notnone_batches[0]:
         action_text = [b['action_text']for b in notnone_batches]
@@ -72,9 +81,11 @@ def t2m_collate(batch, target_batch_size):
     adapted_batch = [{
         'inp': torch.tensor(b[4].T).float().unsqueeze(1), # [seqlen, J] -> [J, 1, seqlen]
         'text': b[2], #b[0]['caption']
-        'tokens': b[6],
+        'tokens': b[8] if len(b) > 7 else b[6],
         'lengths': b[5],
-        'key': b[7] if len(b) > 7 else None,
+        'start_location': b[6] if len(b) > 7 else None,
+        'goal_location': b[7] if len(b) > 7 else None,
+        'key': b[9] if len(b) > 9 else None,
     } for b in full_batch]
     return collate(adapted_batch)
 

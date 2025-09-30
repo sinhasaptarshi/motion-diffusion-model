@@ -74,10 +74,11 @@ def get_model_path_from_args():
 def add_base_options(parser):
     group = parser.add_argument_group('base')
     group.add_argument("--cuda", default=True, type=bool, help="Use cuda device, otherwise use CPU.")
+    group.add_argument("--wandb_name", default='.', type=str, help="WANDB name")
     group.add_argument("--device", default=0, type=int, help="Device id to use.")
     group.add_argument("--seed", default=10, type=int, help="For fixing random seed.")
     group.add_argument("--batch_size", default=64, type=int, help="Batch size during training.")
-    group.add_argument("--train_platform_type", default='NoPlatform', choices=['NoPlatform', 'ClearmlPlatform', 'TensorboardPlatform', 'WandBPlatform'], type=str,
+    group.add_argument("--train_platform_type", default='WandBPlatform', choices=['NoPlatform', 'ClearmlPlatform', 'TensorboardPlatform', 'WandBPlatform'], type=str,
                        help="Choose platform to log results. NoPlatform means no logging.")
     group.add_argument("--external_mode", default=False, type=bool, help="For backward cometability, do not change or delete.")
 
@@ -105,6 +106,8 @@ def add_model_options(parser):
                        help="Number of layers.")
     group.add_argument("--latent_dim", default=512, type=int,
                        help="Transformer/GRU width.")
+    group.add_argument("--combine_conds", default='cross-attention', type=str,
+                       help="How to combine conditions.")
     group.add_argument("--cond_mask_prob", default=.1, type=float,
                        help="The probability of masking the condition during training."
                             " For classifier-free guidance learning.")
@@ -136,7 +139,7 @@ def add_model_options(parser):
 
 def add_data_options(parser):
     group = parser.add_argument_group('dataset')
-    group.add_argument("--dataset", default='humanml', choices=['humanml', 'kit', 'humanact12', 'uestc'], type=str,
+    group.add_argument("--dataset", default='humanml', choices=['humanml', 'kit', 'humanact12', 'uestc', 'HDEPIC', 'HOT3D'], type=str,
                        help="Dataset name (choose from list).")
     group.add_argument("--data_dir", default="", type=str,
                        help="If empty, will use defaults according to the specified dataset.")
@@ -148,7 +151,7 @@ def add_training_options(parser):
                        help="Path to save checkpoints and results.")
     group.add_argument("--overwrite", action='store_true',
                        help="If True, will enable to use an already existing save_dir.")
-    group.add_argument("--lr", default=1e-4, type=float, help="Learning rate.")
+    group.add_argument("--lr", default=5e-6, type=float, help="Learning rate.")
     group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
     group.add_argument("--lr_anneal_steps", default=0, type=int, help="Number of learning rate anneal steps.")
     group.add_argument("--eval_batch_size", default=32, type=int,
@@ -162,9 +165,9 @@ def add_training_options(parser):
                        help="Number of repetitions for evaluation loop during training.")
     group.add_argument("--eval_num_samples", default=1_000, type=int,
                        help="If -1, will use all samples in the specified split.")
-    group.add_argument("--log_interval", default=1_000, type=int,
+    group.add_argument("--log_interval", default=100, type=int,
                        help="Log losses each N steps")
-    group.add_argument("--save_interval", default=50_000, type=int,
+    group.add_argument("--save_interval", default=5_000, type=int,
                        help="Save checkpoints and run evaluation each N steps")
     group.add_argument("--num_steps", default=600_000, type=int,
                        help="Training will stop after the specified number of steps.")
@@ -202,7 +205,7 @@ def add_sampling_options(parser):
     group.add_argument("--num_samples", default=6, type=int,
                        help="Maximal number of prompts to sample, "
                             "if loading dataset from file, this field will be ignored.")
-    group.add_argument("--num_repetitions", default=3, type=int,
+    group.add_argument("--num_repetitions", default=7, type=int,
                        help="Number of repetitions, per sample (text prompt/action)")
     group.add_argument("--guidance_param", default=2.5, type=float,
                        help="For classifier-free sampling - specifies the s parameter, as defined in the paper.")
@@ -271,6 +274,8 @@ def get_cond_mode(args):
         cond_mode = 'no_cond'
     elif args.dataset in ['kit', 'humanml']:
         cond_mode = 'text'
+    elif args.dataset in ['HDEPIC', 'HOT3D']:
+        cond_mode = ['text', 'location']
     else:
         cond_mode = 'action'
     return cond_mode

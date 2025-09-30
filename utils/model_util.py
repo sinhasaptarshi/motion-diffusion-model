@@ -4,6 +4,7 @@ from diffusion import gaussian_diffusion as gd
 from diffusion.respace import SpacedDiffusion, space_timesteps
 from utils.parser_util import get_cond_mode
 from data_loaders.humanml_utils import HML_EE_JOINT_NAMES
+import pdb
 
 def load_model_wo_clip(model, state_dict):
     # assert (state_dict['sequence_pos_encoder.pe'][:model.sequence_pos_encoder.pe.shape[0]] == model.sequence_pos_encoder.pe).all()  # TEST
@@ -11,8 +12,12 @@ def load_model_wo_clip(model, state_dict):
     del state_dict['sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
     del state_dict['embed_timestep.sequence_pos_encoder.pe']  # no need to load it (fixed), and causes size mismatch for older models
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') or 'sequence_pos_encoder' in k for k in missing_keys])
+    # pdb.set_trace()
+    # assert len(unexpected_keys) == 0
+    print(missing_keys)
+    print(unexpected_keys)
+    assert all(['embed_text' in k or 'encode_text' in k for k in unexpected_keys])
+    assert all([k.startswith('clip_model.') or 'sequence_pos_encoder' in k or 'start_loc' in k or 'goal_loc' in k or 'start_goal' in k or 'embed_text' in k for k in missing_keys])
 
 
 def create_model_and_diffusion(args, data):
@@ -38,7 +43,7 @@ def get_model_args(args, data):
     nfeats = 6
     all_goal_joint_names = []
 
-    if args.dataset == 'humanml':
+    if args.dataset in ['humanml','HDEPIC','HOT3D']:
         data_rep = 'hml_vec'
         njoints = 263
         nfeats = 1
@@ -67,7 +72,7 @@ def get_model_args(args, data):
             'text_encoder_type': args.text_encoder_type,
             'pos_embed_max_len': args.pos_embed_max_len, 'mask_frames': args.mask_frames,
             'pred_len': args.pred_len, 'context_len': args.context_len, 'emb_policy': emb_policy,
-            'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers,
+            'all_goal_joint_names': all_goal_joint_names, 'multi_target_cond': multi_target_cond, 'multi_encoder_type': multi_encoder_type, 'target_enc_layers': target_enc_layers, 'combine_conds': args.combine_conds
             }
 
 

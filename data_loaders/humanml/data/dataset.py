@@ -7,7 +7,8 @@ import random
 import codecs as cs
 from tqdm import tqdm
 import spacy
-
+import pdb
+import json
 from torch.utils.data._utils.collate import default_collate
 from data_loaders.humanml.utils.word_vectorizer import WordVectorizer
 from data_loaders.humanml.utils.get_opt import get_opt
@@ -38,6 +39,7 @@ class Text2MotionDataset(data.Dataset):
 
         new_name_list = []
         length_list = []
+        pdb.set_trace()
         for name in tqdm(id_list):
             try:
                 motion = np.load(pjoin(opt.motion_dir, name + '.npy'))
@@ -213,20 +215,41 @@ class Text2MotionDatasetV2(data.Dataset):
             self.max_length = self.opt.fixed_len
         self.pointer = 0
         self.max_motion_length = opt.max_motion_length
+        # self.max_motion_length = 400
+        # self.max_motion_length = 900
         min_motion_len = 40 if self.opt.dataset_name =='t2m' else 24
+
+        splits = json.load(open('split.json'))
+        train_videos = splits['train']
+        validation_videos = splits['val']
+
+        hdepic_splits = json.load(open(f'{self.opt.dataset_name}_splits_per_video.json'))
+        train_videos.extend(hdepic_splits['train'])
+        validation_videos.extend(hdepic_splits['val'])
 
         data_dict = {}
         id_list = []
+        texts = os.listdir(opt.text_dir)
         with cs.open(split_file, 'r') as f:
             for line in f.readlines():
                 id_list.append(line.strip())
         # id_list = id_list[:200]
+        id_list = list(set(id_list))
+        text_files = os.listdir(opt.text_dir)
+        # id_list = [file for file in id_list if f'{file}.txt' in text_files]
+        # pdb.set_trace()
+        # opt.use_cache = False
+        # pdb.set_trace()
+        max_motion_len = np.inf
+        # max_motion_len = 200
 
         new_name_list = []
         length_list = []
 
         _split = os.path.basename(split_file).replace('.txt', '')
+        self.mode = _split
         _name =''
+        # pdb.set_trace()
         # cache_path = os.path.join(opt.meta_dir, self.opt.dataset_name + '_' + _split + _name + '.npy')
         cache_path = os.path.join(opt.cache_dir, 'dataset', self.opt.dataset_name + '_' + _split + _name + '.npy')
         if opt.use_cache and os.path.exists(cache_path):
@@ -236,33 +259,73 @@ class Text2MotionDatasetV2(data.Dataset):
             # name_list = name_list[:15]; length_list = length_list[:15]
             # data_dict = {key: data_dict[key] for key in name_list}
         else:
+            # pdb.set_trace()
             for name in tqdm(id_list):
                 try:
                     motion = np.load(pjoin(opt.motion_dir, name + '.npy'))
-                    if (len(motion)) < min_motion_len or (len(motion) >= 200):
+                    
+                    if opt.dataset_name in ['HDEPIC', 'HOT3D']:
+
+                        if _split == 'train':
+                            if name not in train_videos:
+                                continue
+                        elif _split == 'test':
+                            if name not in validation_videos:
+                                continue
+                            if name.startswith('M'):
+                                continue
+                    else:
+                        vid_name = '_'.join(name.split('_')[:-2])
+                        if _split == 'train':
+                            if vid_name.startswith('M'):
+                                vid_name = vid_name[1:]
+                            if vid_name not in train_videos:
+                                continue
+                            
+                        if _split == 'test':
+                            if vid_name not in validation_videos:
+                                continue
+                        
+                    if (len(motion)) < min_motion_len or (len(motion) > max_motion_len):
+                        
                         continue
                     text_data = []
                     flag = False
+                    
                     with cs.open(pjoin(opt.text_dir, name + '.txt')) as f:
                         for line in f.readlines():
                             text_dict = {}
+                            # pdb.set_trace()
                             line_split = line.strip().split('#')
                             caption = line_split[0]
                             tokens = line_split[1].split(' ')
-                            f_tag = float(line_split[2])
-                            to_tag = float(line_split[3])
-                            f_tag = 0.0 if np.isnan(f_tag) else f_tag
-                            to_tag = 0.0 if np.isnan(to_tag) else to_tag
+                            if len(line_split) < 4:
+                                f_tag = 0
+                                to_tag = len(motion)
+                            else:
+                                f_tag = float(line_split[2])
+                                to_tag = float(line_split[3])
+                                f_tag = 0.0 if np.isnan(f_tag) else f_tag
+                                to_tag = 0.0 if np.isnan(to_tag) else to_tag
 
                             text_dict['caption'] = caption
                             text_dict['tokens'] = tokens
+                            # pdb.set_trace()
                             if f_tag == 0.0 and to_tag == 0.0:
                                 flag = True
                                 text_data.append(text_dict)
                             else:
                                 try:
-                                    n_motion = motion[int(f_tag*20) : int(to_tag*20)]
-                                    if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
+                                    # n_motion = motion[int(f_tag*20) : int(to_tag*20)]
+                                    if name == 'P01-20240203-121517_obj_1_0-74':
+                                        pdb.set_trace()
+                                    # n_motion = motion[::8]
+                                    # n_motion = motion[6::12]
+                                    n_motion = motion
+                                    if np.isnan(n_motion.sum()):
+                                        continue
+                                        pdb.set_trace()
+                                    if (len(n_motion)) < min_motion_len or (len(n_motion) >= 400):
                                         continue
                                     new_name = random.choice('ABCDEFGHIJKLMNOPQRSTUVW') + '_' + name
                                     while new_name in data_dict:
@@ -272,6 +335,8 @@ class Text2MotionDatasetV2(data.Dataset):
                                                            'text':[text_dict]}
                                     new_name_list.append(new_name)
                                     length_list.append(len(n_motion))
+                                    # if len(length_list) > 100000:
+
                                 except:
                                     print(line_split)
                                     print(line_split[2], line_split[3], f_tag, to_tag, name)
@@ -284,6 +349,7 @@ class Text2MotionDatasetV2(data.Dataset):
                         new_name_list.append(name)
                         length_list.append(len(motion))
                 except:
+                    # pdb.set_trace()
                     pass
 
             name_list, length_list = zip(*sorted(zip(new_name_list, length_list), key=lambda x: x[1]))
@@ -299,7 +365,7 @@ class Text2MotionDatasetV2(data.Dataset):
         self.data_dict = data_dict
         self.name_list = name_list
         self.reset_max_len(self.max_length)
-
+        # pdb.set_trace()
     def reset_max_len(self, length):
         assert length <= self.max_motion_length
         self.pointer = np.searchsorted(self.length_arr, length)
@@ -317,7 +383,21 @@ class Text2MotionDatasetV2(data.Dataset):
         key = self.name_list[idx]
         data = self.data_dict[key]
         motion, m_length, text_list = data['motion'], data['length'], data['text']
+        
+        # pdb.set_trace()
         # Randomly select a caption
+        # jump = 12
+        # if self.mode == 'train':
+        #     start = int(np.random.choice(np.arange(jump)))
+        #     motion = motion[start::jump]
+        #     m_length = len(motion)
+        # else:
+        #     start = 6
+        
+        
+        # if m_length <= 0:
+        #     pdb.set_trace()
+
         text_data = random.choice(text_list)
         caption, tokens = text_data['caption'], text_data['tokens']
 
@@ -358,12 +438,21 @@ class Text2MotionDatasetV2(data.Dataset):
             m_length = self.opt.fixed_len
         
         idx = random.randint(0, len(motion) - m_length)
+        idx = 0
         if self.opt.disable_offset_aug:
             idx = random.randint(0, self.opt.unit_length)
         motion = motion[idx:idx+m_length]
 
+
+
         "Z Normalization"
         motion = (motion - self.mean) / self.std
+        # print(motion.shape)
+        
+
+        start_location = motion[0]
+        goal_location = motion[-1]
+
 
         if m_length < self.max_motion_length:
             motion = np.concatenate([motion,
@@ -371,10 +460,11 @@ class Text2MotionDatasetV2(data.Dataset):
                                      ], axis=0)
         # print(word_embeddings.shape, motion.shape)
         # print(tokens)
+        # pdb.set_trace()
 
         length = (original_length, m_length) if self.opt.fixed_len > 0 else m_length
 
-        return word_embeddings, pos_one_hots, caption, sent_len, motion, length, '_'.join(tokens)
+        return word_embeddings, pos_one_hots, caption, sent_len, motion, length, start_location, goal_location, '_'.join(tokens), key
 
 
 '''For use of training baseline'''
@@ -683,6 +773,9 @@ class TextOnlyDataset(data.Dataset):
 
         data_dict = {}
         id_list = []
+        hdepic_splits = json.load(open(f'{self.opt.dataset_name}_splits_per_video.json'))
+        train_videos = hdepic_splits['train']
+        validation_videos = hdepic_splits['val']
         with cs.open(split_file, 'r') as f:
             for line in f.readlines():
                 id_list.append(line.strip())
@@ -692,18 +785,32 @@ class TextOnlyDataset(data.Dataset):
         length_list = []
         for name in tqdm(id_list):
             try:
+
+                # pdb.set_trace()
                 text_data = []
                 flag = False
                 with cs.open(pjoin(opt.text_dir, name + '.txt')) as f:
+                    if opt.dataset_name == 'HDEPIC':
+                        if name not in validation_videos:
+                            continue
                     for line in f.readlines():
                         text_dict = {}
                         line_split = line.strip().split('#')
-                        caption = line_split[0]
+                        caption = line_split[0]#.replace('picking', 'walking and picking').replace('putting', 'walking and putting')
+                        # pdb.set_trace()
+                        # line_split[1] = line_split[1].replace('be/VERB pick/VERB', 'be/VERB walk/VERB and/CONJ pick/VERB')
+                        # if len(line_split) == 1:
+                            # pdb.set_trace()
+                            # continue
                         tokens = line_split[1].split(' ')
-                        f_tag = float(line_split[2])
-                        to_tag = float(line_split[3])
-                        f_tag = 0.0 if np.isnan(f_tag) else f_tag
-                        to_tag = 0.0 if np.isnan(to_tag) else to_tag
+                        try:
+                            f_tag = float(line_split[2])
+                            to_tag = float(line_split[3])
+                            f_tag = 0.0 if np.isnan(f_tag) else f_tag
+                            to_tag = 0.0 if np.isnan(to_tag) else to_tag
+                        except:
+                            f_tag = 0.0
+                            to_tag = 0.0
 
                         text_dict['caption'] = caption
                         text_dict['tokens'] = tokens
@@ -746,9 +853,7 @@ class TextOnlyDataset(data.Dataset):
         # Randomly select a caption
         text_data = random.choice(text_list)
         caption, tokens = text_data['caption'], text_data['tokens']
-        return None, None, caption, None, np.array([0]), self.fixed_length, None
-        # fixed_length can be set from outside before sampling
-
+        return None, None, caption, None, np.array([0]), self.fixed_length, None, None, None, self.name_list[idx]
 # A wrapper class for t2m original dataset for MDM purposes
 class HumanML3D(data.Dataset):
     def __init__(self, mode, datapath='./dataset/humanml_opt.txt', split="train", **kwargs):
@@ -781,19 +886,40 @@ class HumanML3D(data.Dataset):
         print('Loading dataset %s ...' % opt.dataset_name)
 
         if mode == 'gt':
+            
+            # self.mean = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'mean.npy'))
+            # self.std = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'std.npy'))
+
+            self.mean = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'mean.npy'))
+            self.std = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'std.npy'))
+           
             # used by T2M models (including evaluators)
-            self.mean = np.load(pjoin(opt.meta_dir, f'{opt.dataset_name}_mean.npy'))
-            self.std = np.load(pjoin(opt.meta_dir, f'{opt.dataset_name}_std.npy'))
-        elif mode in ['train', 'eval', 'text_only']:
+
+        elif mode in ['train','eval', 'text_only']:
             # used by our models
+            # self.mean = np.load(pjoin('dataset/HumanML3D','Mean.npy'))
+            # self.std = np.load(pjoin('dataset/HumanML3D', 'Std.npy'))
+
             self.mean = np.load(pjoin(opt.data_root, 'Mean.npy'))
             self.std = np.load(pjoin(opt.data_root, 'Std.npy'))
+
+            # self.mean = np.load('old_model/t2m_mean.npy')
+            # self.std = np.load('old_model/t2m_std.npy')
+
 
         if mode == 'eval':
             # used by T2M models (including evaluators)
             # this is to translate their norms to ours
-            self.mean_for_eval = np.load(pjoin(opt.meta_dir, f'{opt.dataset_name}_mean.npy'))
-            self.std_for_eval = np.load(pjoin(opt.meta_dir, f'{opt.dataset_name}_std.npy'))
+
+            # self.mean_for_eval = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'mean.npy'))
+            # self.std_for_eval = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'std.npy'))
+
+            self.mean_for_eval = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'mean.npy'))
+            self.std_for_eval = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'std.npy'))
+
+            # self.mean_for_eval = np.load('old_model/t2m_mean.npy')
+            # self.std_for_eval = np.load('old_model/t2m_std.npy')
+
 
         self.split_file = pjoin(opt.data_root, f'{split}.txt')
         if mode == 'text_only':
@@ -821,3 +947,95 @@ class HumanML3D(data.Dataset):
 class KIT(HumanML3D):
     def __init__(self, mode, datapath='./dataset/kit_opt.txt', split="train", **kwargs):
         super(KIT, self).__init__(mode, datapath, split, **kwargs)
+
+
+class HDEPIC(data.Dataset):
+    def __init__(self, mode, datapath='./dataset/hdepic_opt.txt', split="train", **kwargs):
+        self.mode = mode
+
+        # Configurations of T2M dataset and KIT dataset is almost the same
+        abs_base_path = kwargs.get('abs_path', '.')
+        dataset_opt_path = pjoin(abs_base_path, datapath)
+        device = kwargs.get('device', None)
+        opt = get_opt(dataset_opt_path, device)
+        # opt.meta_dir = pjoin(abs_base_path, opt.meta_dir)
+        opt.cache_dir = kwargs.get('cache_path', '.')
+        opt.motion_dir = pjoin(abs_base_path, opt.motion_dir)
+        opt.text_dir = pjoin(abs_base_path, opt.text_dir)
+        opt.model_dir = pjoin(abs_base_path, opt.model_dir)
+        opt.checkpoints_dir = pjoin(abs_base_path, opt.checkpoints_dir)
+        opt.data_root = pjoin(abs_base_path, opt.data_root)
+        opt.save_root = pjoin(abs_base_path, opt.save_root)
+        opt.meta_dir = pjoin(abs_base_path, './dataset')
+        opt.use_cache = kwargs.get('use_cache', True)
+        opt.fixed_len = kwargs.get('fixed_len', 0)
+        if opt.fixed_len > 0:
+            opt.max_motion_length = opt.fixed_len
+        is_autoregressive = kwargs.get('autoregressive', False)
+        opt.disable_offset_aug = is_autoregressive and (opt.fixed_len > 0) and (mode == 'eval')  # for autoregressive evaluation, use the start of the motion and not something from the middle
+        self.opt = opt
+        print('Loading dataset %s ...' % opt.dataset_name)
+        
+
+        if mode == 'gt':
+            
+            # self.mean = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'mean.npy'))
+            # self.std = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'std.npy'))
+
+            self.mean = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'mean.npy'))
+            self.std = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'std.npy'))
+           
+            # used by T2M models (including evaluators)
+
+        elif mode in ['train','eval', 'text_only']:
+            # used by our models
+            self.mean = np.load(pjoin(opt.data_root, 'Mean.npy'))
+            self.std = np.load(pjoin(opt.data_root, 'Std.npy'))
+
+            # self.mean = np.load('old_model/t2m_mean.npy')
+            # self.std = np.load('old_model/t2m_std.npy')
+
+
+        if mode == 'eval':
+            # used by T2M models (including evaluators)
+            # this is to translate their norms to ours
+
+            # self.mean_for_eval = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'mean.npy'))
+            # self.std_for_eval = np.load(pjoin('t2m/Comp_v6_KLD01/meta', f'std.npy'))
+
+            self.mean_for_eval = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'mean.npy'))
+            self.std_for_eval = np.load(pjoin('../text-to-motion/checkpoints/t2m/Comp_v6_KLD01/meta/', f'std.npy'))
+
+            # self.mean_for_eval = np.load('old_model/t2m_mean.npy')
+            # self.std_for_eval = np.load('old_model/t2m_std.npy')
+
+
+        self.split_file = pjoin(opt.data_root, f'{split}.txt')
+        if mode == 'text_only':
+            self.mean = np.load('dataset/Nymeria/Mean.npy')
+            self.std = np.load('dataset/Nymeria/Std.npy')
+            self.t2m_dataset = TextOnlyDataset(self.opt, self.mean, self.std, self.split_file)
+        else:
+            self.w_vectorizer = WordVectorizer(pjoin(opt.cache_dir, 'glove'), 'our_vab')
+            self.t2m_dataset = Text2MotionDatasetV2(self.opt, self.mean, self.std, self.split_file, self.w_vectorizer)
+            self.num_actions = 1 # dummy placeholder
+        # import pdb
+        # pdb.set_trace()
+
+        self.mean_gpu = torch.tensor(self.mean).to(device)[None, :, None, None]
+        self.std_gpu = torch.tensor(self.std).to(device)[None, :, None, None]
+
+        assert len(self.t2m_dataset) > 1, 'You loaded an empty dataset, ' \
+                                          'it is probably because your data dir has only texts and no motions.\n' \
+                                          'To train and evaluate MDM you should get the FULL data as described ' \
+                                          'in the README file.'
+
+    def __getitem__(self, item):
+        return self.t2m_dataset.__getitem__(item)
+
+    def __len__(self):
+        return self.t2m_dataset.__len__()
+
+class HOT3D(HDEPIC):
+    def __init__(self, mode, datapath='./dataset/hot3d_opt.txt', split="train", **kwargs):
+        super(HOT3D, self).__init__(mode, datapath, split, **kwargs)

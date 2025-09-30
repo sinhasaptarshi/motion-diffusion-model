@@ -80,27 +80,49 @@ class LossAwareSampler(ScheduleSampler):
         :param local_ts: an integer Tensor of timesteps.
         :param local_losses: a 1D Tensor of losses.
         """
-        batch_sizes = [
-            th.tensor([0], dtype=th.int32, device=local_ts.device)
-            for _ in range(dist.get_world_size())
-        ]
-        dist.all_gather(
-            batch_sizes,
-            th.tensor([len(local_ts)], dtype=th.int32, device=local_ts.device),
-        )
 
-        # Pad all_gather batches to be the maximum batch size.
-        batch_sizes = [x.item() for x in batch_sizes]
-        max_bs = max(batch_sizes)
 
-        timestep_batches = [th.zeros(max_bs).to(local_ts) for bs in batch_sizes]
-        loss_batches = [th.zeros(max_bs).to(local_losses) for bs in batch_sizes]
-        dist.all_gather(timestep_batches, local_ts)
-        dist.all_gather(loss_batches, local_losses)
-        timesteps = [
-            x.item() for y, bs in zip(timestep_batches, batch_sizes) for x in y[:bs]
-        ]
-        losses = [x.item() for y, bs in zip(loss_batches, batch_sizes) for x in y[:bs]]
+        if dist.is_initialized():
+            # --- Distributed Training Logic ---
+            world_size = dist.get_world_size()
+
+            # Prepare list for batch sizes from all processes
+            batch_sizes = [
+                th.tensor([0], dtype=th.int32, device=local_ts.device)
+                for _ in range(world_size) # Use actual world_size here
+            ]
+            # Gather local batch sizes from all processes
+            dist.all_gather(
+                batch_sizes,
+                th.tensor([len(local_ts)], dtype=th.int32, device=local_ts.device),
+            )
+
+            # Convert to Python list and find max batch size across all processes
+            batch_sizes = [x.item() for x in batch_sizes]
+            max_bs = max(batch_sizes)
+
+            # Prepare tensors for gathering timesteps and losses, padded to max_bs
+            # Use .to(local_ts.device) to ensure they are on the correct device
+            timestep_batches = [th.zeros(max_bs, dtype=local_ts.dtype).to(local_ts.device) for _ in range(world_size)]
+            loss_batches = [th.zeros(max_bs, dtype=local_losses.dtype).to(local_losses.device) for _ in range(world_size)]
+            
+            # Gather padded timesteps and losses from all processes
+            dist.all_gather(timestep_batches, local_ts)
+            dist.all_gather(loss_batches, local_losses)
+
+            # Reconstruct the original lists of timesteps and losses from all processes
+            timesteps = [
+                x.item() for y, bs in zip(timestep_batches, batch_sizes) for x in y[:bs]
+            ]
+            losses = [x.item() for y, bs in zip(loss_batches, batch_sizes) for x in y[:bs]]
+
+        else:
+            # --- Single-GPU / Non-Distributed Training Logic ---
+            # If not in a distributed setting, local_ts and local_losses are the only data we have.
+            # Convert them directly to Python lists of items.
+            timesteps = [x.item() for x in local_ts]
+            losses = [x.item() for x in local_losses]
+
         self.update_with_all_losses(timesteps, losses)
 
     @abstractmethod
@@ -129,7 +151,7 @@ class LossSecondMomentResampler(LossAwareSampler):
         self._loss_history = np.zeros(
             [diffusion.num_timesteps, history_per_term], dtype=np.float64
         )
-        self._loss_counts = np.zeros([diffusion.num_timesteps], dtype=np.int)
+        self._loss_counts = np.zeros([diffusion.num_timesteps], dtype=int)
 
     def weights(self):
         if not self._warmed_up():
